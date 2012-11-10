@@ -1,6 +1,6 @@
-=======
-rtm-cli
-=======
+=========================================
+Remember The Milk command line interface
+=========================================
 
 Yeah. I'm trying to get organized. So I wrote this lightweigth CLI for
 https://www.rememberthemilk.com/.
