@@ -10,13 +10,13 @@ import pickle
 import sys
 import os
 
-options = ['%priority',  '@list', '^due',  ':estimate', '#tags']
+options = ['%priority',  '@list', '^due',  ':estimate', '#tag']
 
 __doc__ = '''
 Usage: rtm show [-a] [<sort>] [<filter>...]
        rtm (add | edit) [%s] <task>...
-       rtm (del | done) <task>...
-       rtm [list | www | -h]
+       rtm (del | done) <filter>...
+       rtm [list | refresh | www | -h]
 
 Options:
 
@@ -45,7 +45,7 @@ class DB(object):
     def __getattr__(self, attr):
         if attr == 'timeline' and 'timeline' not in self.data:
             timeline = api.timelines.create().timeline
-            self.__setattr__(self, 'timeline', timeline)
+            self.__setattr__('timeline', timeline)
             return timeline
         return self.data.get(attr)
 
@@ -55,6 +55,15 @@ class DB(object):
         self.data[attr] = value
         with open(self.db, 'wb') as fd:
             pickle.dump(self.data.copy(), fd)
+
+    def __delattr__(self, attr):
+        if attr.startswith('_') or attr in ('data', 'db'):
+            return object.__delattr__(self, attr)
+        if attr in self.data:
+            del self.data[attr]
+            with open(self.db, 'wb') as fd:
+                pickle.dump(self.data.copy(), fd)
+
 
 db = DB()
 
@@ -102,6 +111,7 @@ class List(Node):
 
     format = '{}'.format
     keys = ['name']
+    db_keys = ['id', 'name', 'smart', 'locked', 'deleted', 'archived']
 
     @classmethod
     def get(cls, id_or_name):
@@ -121,7 +131,8 @@ class List(Node):
             if not dump:
                 for l in api.lists.getList().lists.list:
                     l = cls(l)
-                    dump.append(dict(id=l.id, name=l.name))
+                    dump.append(dict(
+                        [(k, getattr(l, k, None)) for k in cls.db_keys]))
                 db.lists = dump
             for kw in dump:
                 l = cls(object(), **kw)
@@ -149,7 +160,8 @@ class Task(Node):
          )
 
     def __cmp__(self, other):
-        _cmp = [self.cmps[a] for a in db.sort_order]
+        _cmp = [self.cmps.get(a, '') for a in db.sort_order]
+        _cmp = [a for a in _cmp if a]
         return cmp(
                 [getattr(self, a) or '9999' for a in _cmp],
                 [getattr(other, a) or '9999' for a in _cmp])
@@ -204,6 +216,14 @@ class Task(Node):
     def __repr__(self):
         return '<Task %s>' % self.name
 
+    def call(self, action, **kw):
+        kw['timeline'] = db.timeline
+        kw['list_id'] = self.parent.parent.id
+        kw['taskseries_id'] = self.parent.id
+        kw['task_id'] = self.id
+        action = getattr(api.tasks, action)
+        return action(**kw)
+
     @classmethod
     def values(cls, **kw):
         if not cls._tasks:
@@ -221,17 +241,27 @@ class Task(Node):
         return cls._tasks
 
 
-def extract_option(prefix, args, unique=True):
+def extract_option(prefix, args):
     """Extract options like ``@list`` from command line"""
+    if prefix in ('#',):
+        unique = False
+    else:
+        unique = True
     value = [a for a in args if a.startswith(prefix)]
     if len(value) == 1:
         value = value[0]
         args.remove(value)
-        return value[1:]
+        value = value[1:]
+        if not unique:
+            return [value]
+        return value
     elif len(value) > 1 and unique:
         print('More than one %s found in args' % prefix)
         sys.exit(1)
     elif len(value) > 1 and not unique:
+        for v in value:
+            if v in args:
+                args.remove(v)
         return [v[1:] for v in value]
     return None
 
@@ -247,13 +277,8 @@ def main():
     argv = [a for a in argv if a]
 
     # extract_option
-    priority = extract_option('%', argv)
-    due = extract_option('^', argv)
-    list_name = extract_option('@', argv)
-    estimate = extract_option(':', argv)
-    tags = extract_option('#', argv)
-    if tags and not isinstance(tags, list):
-        tags = [tags]
+    for k in options:
+        args[k] = extract_option(k[0], argv)
 
     # determine action
     action = None
@@ -269,18 +294,22 @@ def main():
         # open a browser and exit
         webbrowser.open('https://www.rememberthemilk.com/')
         sys.exit(0)
-    elif args.get('lists'):
+    elif args.get('lists') or args.get('refresh'):
+        if args.get('refresh'):
+            del db.lists
         # list lists and exit
-        for l in List.values():
+        for l in sorted(set(List.values())):
             print(l)
         sys.exit(0)
     elif argv and args['add']:
         # add a new task
         name = ' '.join(argv)
-        if list_name:
-            kw['list_id'] = List.get(list_name).id
-        kw['timeline'] = db.timeline
         print('Adding task "%s"...' % name)
+        if args.get('@list'):
+            l = List.get(args['@list'])
+            kw['list_id'] = l.id
+            print('@list = %s' % l.name)
+        kw['timeline'] = db.timeline
         res = api.tasks.add(name=name, **kw)
         task = Task(res.list.taskseries.task,
                     Node(res.list.taskseries, List(res.list)))
@@ -300,14 +329,40 @@ def main():
     else:
         # show
         kw = {}
-        if args['<filter>'] or args['<sort>'] and argv:
-            db.sort_order = argv[0]
+        show_filters = False
         filters = []
+        for flt in [a for a in argv if ':' in a]:
+            flt = '%s:"%s"' % tuple(flt.split(':', 1))
+            filters.append(flt)
+
+        if args['<filter>'] or args['<sort>'] and argv:
+            sort_order = [a for a in argv if ':' not in a]
+            if sort_order:
+                db.sort_order = sort_order[0]
+
+        due = args.get('^due')
+        if due:
+            if due.startswith('+1'):
+                filters.append('due:tomorrow')
+            elif due in ('now', 'today'):
+                filters.append('dueBefore:%s' % due)
+            elif due.upper() in DAYS:
+                filters.append('dueBefore:%s' % due)
+            elif due.startswith('+'):
+                filters.append('dueWithin:"%s days of today"' % due[1:])
+            elif due.startswith('week'):
+                filters.append('dueWithin:"1 week of today"')
+
+        tags = args.get('#tag') or []
         if tags and len(tags) == 1:
             filters.append('tag:"%s"' % tags[0])
-        if list_name:
-            l = List.get(list_name)
+
+        if args.get('@list'):
+            l = List.get(args['@list'])
             filters.append('list:"%s"' % l.name)
+
+        if filters:
+            show_filters = ' & '.join(filters)
         if not args['--all']:
             filters.append('status:incomplete')
         if filters:
@@ -316,6 +371,11 @@ def main():
                                 couleur.modifiers.inverse,
                                 datetime.now().strftime('%c'),
                                 '(%s)' % db.sort_order,
+                                couleur.modifiers.reset))
+        if show_filters:
+            print('{}{:>75}{}'.format(
+                                couleur.modifiers.inverse,
+                                show_filters,
                                 couleur.modifiers.reset))
         print(Task.header())
         for t in sorted(Task.values(**kw)):
@@ -329,10 +389,11 @@ def main():
 
     if task and args['del']:
         print('Deleting "%s"...' % task.name)
-        api.tasks.delete(**kw)
+        task.action('delete')
         sys.exit(0)
     elif task and args['done']:
         print('Completing "%s"...' % task.name)
+        task.action('complete')
         print api.tasks.complete(**kw)
         sys.exit(0)
     elif task and args['edit']:
@@ -340,6 +401,7 @@ def main():
 
     # take care of options
 
+    estimate = args.get(':estimate')
     if kw and estimate:
         if estimate.endswith('m'):
             unit = 'minutes'
@@ -348,17 +410,20 @@ def main():
         elif estimate.endswith('s'):
             unit = 'days'
         estimate = '%s %s' % (estimate[:-1], unit)
-        print('Setting estimate to %s' % estimate)
+        print(':estimate = %s' % estimate)
         api.tasks.setEstimate(estimate=estimate, **kw)
 
+    priority = args.get('%priority')
     if kw and priority:
-        print('Setting priority to %s' % priority)
+        print('%%priority = %s' % priority)
         api.tasks.setPriority(priority=priority, **kw)
 
+    tags = args.get('#tag') or []
     if kw and tags:
-        print('Setting tags to %s' % ', '.join(tags))
+        print('#tags = %s' % ', '.join(tags))
         api.tasks.addTags(tags=','.join(tags), **kw)
 
+    due = args.get('^due')
     if kw and due:
         for k in DAYS:
             if k.lower().startswith(due.lower()):
@@ -377,11 +442,12 @@ def main():
         elif due.startswith('+'):
             due = datetime.now() + timedelta(int(due[1:]))
         if isinstance(due, datetime):
-            print('Setting due date to %s' % due.strftime('%Y-%m-%d'))
+            print('^due = %s' % due.strftime('%Y-%m-%d'))
             api.tasks.setDueDate(due=due.isoformat().split('.')[0] + 'Z', **kw)
 
+    list_name = args.get('@list')
     if task and list_name and args['edit']:
         kw['from_list_id'] = kw.pop('list_id')
         l = List.get(list_name)
-        print('Moving to %s' % l.name)
+        print('@list = %s' % l.name)
         api.tasks.moveTo(to_list_id=l.id, **kw)
