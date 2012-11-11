@@ -37,9 +37,10 @@ Add a Work task estimated to 5mn for tomorrow::
   $ rtm add @Work :5mn ^+1 Make some coffee
 
 Add a task due for next wednesday with high priority::
+
   $ rtm add %1 ^wednesday Make some coffee
 
-Edit a task. Change due date an list::
+Edit a task. Change due date and list::
 
   $ rtm edit ^+7 @work Make some coffee
 

@@ -314,9 +314,9 @@ def main():
         task = Task(res.list.taskseries.task,
                     Node(res.list.taskseries, List(res.list)))
     elif argv and action in ('edit', 'del', 'done'):
-        # find a task befor performing action
+        # find a task before performing action
         name = ' '.join(argv)
-        tasks = Task.values()
+        tasks = Task.values(filter='status:incomplete')
         tasks = [t for t in tasks if t.name.lower().startswith(name.lower())]
         if len(tasks) == 1:
             task = tasks[0]
@@ -335,7 +335,7 @@ def main():
             flt = '%s:"%s"' % tuple(flt.split(':', 1))
             filters.append(flt)
 
-        if args['<filter>'] or args['<sort>'] and argv:
+        if argv:
             sort_order = [a for a in argv if ':' not in a]
             if sort_order:
                 db.sort_order = sort_order[0]
@@ -344,14 +344,18 @@ def main():
         if due:
             if due.startswith('+1'):
                 filters.append('due:tomorrow')
-            elif due in ('now', 'today'):
-                filters.append('dueBefore:%s' % due)
+            elif due in ('today', 'now', 'tomorrow'):
+                filters.append('due:%s' % due)
+            elif due in ('over', 'overdue'):
+                filters.append('dueBefore:now')
             elif due.upper() in DAYS:
                 filters.append('dueBefore:%s' % due)
             elif due.startswith('+'):
                 filters.append('dueWithin:"%s days of today"' % due[1:])
             elif due.startswith('week'):
                 filters.append('dueWithin:"1 week of today"')
+            elif due.startswith('month'):
+                filters.append('dueWithin:"1 month of today"')
 
         tags = args.get('#tag') or []
         if tags and len(tags) == 1:
@@ -389,11 +393,11 @@ def main():
 
     if task and args['del']:
         print('Deleting "%s"...' % task.name)
-        task.action('delete')
+        task.call('delete')
         sys.exit(0)
     elif task and args['done']:
         print('Completing "%s"...' % task.name)
-        task.action('complete')
+        task.call('complete')
         print api.tasks.complete(**kw)
         sys.exit(0)
     elif task and args['edit']:
@@ -425,25 +429,49 @@ def main():
 
     due = args.get('^due')
     if kw and due:
+        # eval due date
+        now = datetime.now()
         for k in DAYS:
             if k.lower().startswith(due.lower()):
                 due = k
                 break
-        if due.upper() in DAYS:
+        if due.isdigit():
+            # a day
+            day = int(due)
+            if day <= now.day:
+                month = now.month
+                while now.month == month:
+                    now += timedelta(15)
+            due = datetime(now.year, now.month, int(day))
+        elif '-' in due:
+            # month-day
+            try:
+                month, day = due.slit('-')
+                due = datetime(now.year, int(month), int(day))
+            except ValueError:
+                print('^due date format should be mm-dd')
+                sys.exit(1)
+        elif due.upper() in DAYS:
+            # day label
             due = DAYS[due.upper()]
-            now = datetime.now()
             for i in range(7):
                 if calendar.weekday(now.year, now.month, now.day) == due:
                     due = now
                     break
                 now += timedelta(1)
         elif due == 'today':
+            # today
             due = datetime.now()
         elif due.startswith('+'):
+            # +X days
             due = datetime.now() + timedelta(int(due[1:]))
+
         if isinstance(due, datetime):
             print('^due = %s' % due.strftime('%Y-%m-%d'))
             api.tasks.setDueDate(due=due.isoformat().split('.')[0] + 'Z', **kw)
+        else:
+            print("Cant parse due date")
+            sys.exit(1)
 
     list_name = args.get('@list')
     if task and list_name and args['edit']:
